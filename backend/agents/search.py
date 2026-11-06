@@ -1,0 +1,174 @@
+import re
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Any
+from backend.clients.arxiv_client import search_arxiv
+from backend.clients.s2_client import search_semantic_scholar
+from backend.data.vector_store import VectorStore
+from backend.data.models import PaperMeta
+from backend.logging_utils import get_job_logger
+from backend.api.jobs import is_cancelled
+
+logger = logging.getLogger("researchmind.search")
+
+# Bounded: avoid hammering either API despite their own per-client backoff/retry logic
+MAX_SEARCH_WORKERS = 6
+
+def clean_title(title: str) -> str:
+    """
+    Cleans a title by lowercasing and removing non-alphanumeric characters.
+    """
+    return re.sub(r'[^a-z0-9]', '', title.lower())
+
+def is_similar_title(t1: str, t2: str, threshold: float = 0.8) -> bool:
+    """
+    Checks if two titles are similar using Jaccard Similarity of their words.
+    """
+    c1 = clean_title(t1)
+    c2 = clean_title(t2)
+    if c1 == c2:
+        return True
+        
+    words1 = set(re.findall(r'\w+', t1.lower()))
+    words2 = set(re.findall(r'\w+', t2.lower()))
+    
+    if not words1 or not words2:
+        return False
+        
+    jaccard = len(words1.intersection(words2)) / len(words1.union(words2))
+    return jaccard >= threshold
+
+def run_search(state: dict) -> dict:
+    """
+    Retrieves academic literature based on sub-queries, deduplicates, ranks, 
+    populates local vector DB with paper text, and updates pipeline state.
+    """
+    log = get_job_logger(logger, state.get("job_id"))
+    sub_queries = state.get("sub_queries", [])
+    if not sub_queries:
+        sub_queries = [state.get("query", "")]
+
+    if "agent_status" not in state:
+        state["agent_status"] = {}
+
+    state["agent_status"]["search"] = "running"
+    log.info(f"Search Agent: Retrieving papers for sub-queries: {sub_queries}")
+
+    # Extract year range filters from pipeline state
+    filters = state.get("filters", {}) or {}
+    year_range = filters.get("year_range", [None, None]) or [None, None]
+    year_from = year_range[0] if len(year_range) > 0 else None
+    year_to   = year_range[1] if len(year_range) > 1 else None
+    log.info(f"Search Agent: Applying year filter {year_from}–{year_to}")
+    
+    raw_results = []
+
+    # 1. Fetch papers from both sources, in parallel: arXiv and Semantic Scholar are
+    # independent services, and different sub-queries against the same service are
+    # independent too, so all 2*N calls can run concurrently.
+    search_tasks = []
+    for query in sub_queries:
+        search_tasks.append(("arxiv", query))
+        search_tasks.append(("semantic_scholar", query))
+
+    def _run_one_search(source: str, query: str):
+        if source == "arxiv":
+            return source, query, search_arxiv(query, limit=15, year_from=year_from, year_to=year_to)
+        else:
+            return source, query, search_semantic_scholar(query, limit=15, year_from=year_from, year_to=year_to)
+
+    with ThreadPoolExecutor(max_workers=MAX_SEARCH_WORKERS) as executor:
+        futures = {executor.submit(_run_one_search, source, query): (source, query)
+                   for source, query in search_tasks}
+        for future in as_completed(futures):
+            source, query = futures[future]
+            try:
+                _, _, results = future.result()
+                raw_results.extend(results)
+            except Exception as e:
+                if source == "arxiv":
+                    log.error(f"Search Agent arXiv sub-query fail: {e}")
+                else:
+                    log.error(f"Search Agent Semantic Scholar sub-query fail: {e}")
+
+    job_id = state.get("job_id")
+    if job_id and is_cancelled(job_id):
+        log.info(f"Job {job_id} cancelled during search; stopping early.")
+        state["agent_status"]["search"] = "cancelled"
+        state["papers"] = []
+        return state
+
+    # 2. Deduplicate and merge results
+    deduped_papers = []
+    
+    for raw in raw_results:
+        duplicate_index = None
+        for i, existing in enumerate(deduped_papers):
+            # Check DOI match
+            if raw.get("doi") and existing.doi and raw.get("doi").lower() == existing.doi.lower():
+                duplicate_index = i
+                break
+            # Check arXiv ID match
+            if raw.get("arxiv_id") and existing.arxiv_id and raw.get("arxiv_id").lower() == existing.arxiv_id.lower():
+                duplicate_index = i
+                break
+            # Check Title Jaccard similarity
+            if is_similar_title(raw.get("title", ""), existing.title):
+                duplicate_index = i
+                break
+                
+        if duplicate_index is not None:
+            # Merge matching paper details
+            existing = deduped_papers[duplicate_index]
+            log.info(f"Merging duplicates for paper: '{existing.title}'")
+            
+            # Enrich fields if missing
+            if not existing.doi and raw.get("doi"):
+                existing.doi = raw.get("doi")
+            if not existing.arxiv_id and raw.get("arxiv_id"):
+                existing.arxiv_id = raw.get("arxiv_id")
+            if raw.get("pdf_url") and not existing.pdf_url:
+                existing.pdf_url = raw.get("pdf_url")
+            if raw.get("full_text_available") and not existing.full_text_available:
+                existing.full_text_available = True
+            if raw.get("citation_count", 0) > existing.citation_count:
+                existing.citation_count = raw.get("citation_count", 0)
+            if raw.get("citations") and not existing.citations:
+                existing.citations = raw.get("citations")
+            
+            if existing.source != raw.get("source"):
+                existing.source = "merged"
+        else:
+            # Add as a new unique PaperMeta
+            paper_meta = PaperMeta(
+                id=raw["id"],
+                title=raw["title"],
+                authors=raw["authors"],
+                year=raw["year"],
+                venue=raw["venue"],
+                abstract=raw["abstract"],
+                pdf_url=raw.get("pdf_url"),
+                url=raw.get("url"),
+                full_text_available=raw.get("full_text_available", False),
+                citation_count=raw.get("citation_count", 0),
+                citations=raw.get("citations", []),
+                doi=raw.get("doi"),
+                arxiv_id=raw.get("arxiv_id"),
+                source=raw["source"]
+            )
+            deduped_papers.append(paper_meta)
+            
+    # 3. Store in ChromaDB
+    try:
+        vs = VectorStore()
+        # Convert to dictionary representation for vector store import
+        papers_dict_list = [p.model_dump() for p in deduped_papers]
+        vs.add_papers(papers_dict_list)
+    except Exception as e:
+        log.error(f"Failed to store paper embeddings in ChromaDB: {e}")
+
+    state["papers"] = deduped_papers
+    state["agent_status"]["search"] = "done"
+    log.info(f"Search Agent finished: merged into {len(deduped_papers)} unique papers.")
+    
+    return state

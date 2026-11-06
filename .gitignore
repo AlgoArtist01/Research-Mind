@@ -1,0 +1,44 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.log
+
+# Environment variables
+.env
+.env.local
+
+# IDEs
+.vscode/
+.idea/
+
+# Local databases/data
+*.db
+*.sqlite
+
+# Node/React
+node_modules/
+dist/
+build/
+.eslintcache
+
+# Backend
+backend/db/cache/
+backend/db/chroma/
+backend/db/exports/
+backend/db/*.db-shm
+backend/db/*.db-wal
+
+# Scratch / temporary
+scratch/
+pytest-cache-files-*/
+
+
+#CLAUDE
+.claude/
+CLAUDE.md
+docs/ui-spec.md
